@@ -1,7 +1,7 @@
 // applet.js
-// Space Force Intel Applet (INARA + EliteBGS) — robust natural-language routing
+// Space Force Intel Applet (INARA + EliteBGS) — resilient routing + system filter on faction_status
 // Canonical names: Black Sun Crew, Space Force, Oblivion Fleet, Jerome Archer
-// Personal INARA key is injected as {{INARA_API_KEY}} via AICord Secrets.
+// INARA key injected as {{INARA_API_KEY}} via AICord Secrets.
 
 const INARA_API = "https://inara.cz/inapi/v1/";
 
@@ -11,7 +11,7 @@ const BGS_BASES = [
   "https://elitebgs.app/ebgs/v5"
 ];
 
-const UA_HEADERS = { "User-Agent": "SpaceForce-IntelApplet/1.2.0" };
+const UA_HEADERS = { "User-Agent": "SpaceForce-IntelApplet/1.3.0" };
 
 // ---------------------------- Canonicalization & Overrides ----------------------------
 const CANONICAL_NAMES = {
@@ -26,6 +26,7 @@ const SYSTEM_ALIASES = {
   "14850": "LTT 14850",
   "ltt14850": "LTT 14850",
   "ltt 14850": "LTT 14850",
+  "ltt-14850": "LTT 14850",
   "guragwe": "Guragwe",
   "alrai sector fw-v b2-2": "Alrai Sector FW-V b2-2"
 };
@@ -52,7 +53,11 @@ function canonicalizeName(raw){
 function canonicalizeSystem(raw){
   if (!raw) return raw;
   const key = raw.toLowerCase().trim();
-  return SYSTEM_ALIASES[key] || raw;
+  if (SYSTEM_ALIASES[key]) return SYSTEM_ALIASES[key];
+  // Generic LTT #### / LTT-#### normalizer
+  const m = key.match(/\bltt[-\s]?(\d{4,5})\b/i);
+  if (m) return `LTT ${m[1]}`;
+  return raw;
 }
 
 // ---------------------------- EliteBGS helpers ----------------------------
@@ -82,17 +87,49 @@ function collectStates(p){
   return [...act, ...pen, ...rec];
 }
 
-async function bgsFactionStatus(factionName){
+function safeDocs(json){
+  // EliteBGS v5 returns { docs: [...] }; guard for weird shapes
+  const d = json && typeof json === "object" ? json.docs : null;
+  return Array.isArray(d) ? d : [];
+}
+
+async function bgsFactionStatus(factionName, systemFilter){
   const fName = canonicalizeName(factionName);
   const { res, error, base } = await bgsFetch(`/factions?name=${encodeURIComponent(fName)}&timeMax=now`);
   if (error) return { error: `Could not reach EliteBGS: ${error}` };
-  const json = await res.json();
-  const f = json?.docs?.[0];
+  let json;
+  try { json = await res.json(); } catch { return { error: "EliteBGS JSON parse error (factions)." }; }
+  const f = safeDocs(json)[0];
   if (!f) return { text: `Faction not found: ${fName}` };
 
+  const presence = f.faction_presence || f.presences || [];
+
+  // If a specific system was requested (like your bot’s suggestion), filter to that system.
+  if (okStr(systemFilter)){
+    const sysName = canonicalizeSystem(systemFilter);
+    const p = presence.find(x => (x.system_name || x.systemName || "").toLowerCase() === sysName.toLowerCase());
+    if (!p) return { text: `No presence for ${fName} in ${sysName}.` };
+
+    const infRaw = (p.influence != null) ? p.influence : (p.faction_details?.influence);
+    const inf = pct(infRaw);
+    const states = collectStates(p);
+    const override = (sysName.toLowerCase() === "ltt 14850")
+      ? SPACEFORCE_OVERRIDES.ltt14850?.[fName] : null;
+
+    const out = {
+      faction: fName,
+      system: sysName,
+      influence: inf,
+      states,
+      note: override?.cannotRetreat ? override.note : undefined,
+      _source: { baseUsed: base, endpoint: "factions" }
+    };
+    return { json: out };
+  }
+
+  // Otherwise, full spread
   const lines = [];
   lines.push(`**${fName}** — Allegiance: ${f.allegiance || "Unknown"} | Gov: ${f.government || "Unknown"}`);
-  const presence = f.faction_presence || f.presences || [];
   for (const p of presence){
     const sys = p.system_name || p.systemName;
     const infRaw = (p.influence != null) ? p.influence : (p.faction_details?.influence);
@@ -110,8 +147,9 @@ async function bgsSystemStatus(systemName){
   const sName = canonicalizeSystem(systemName);
   const { res, error, base } = await bgsFetch(`/systems?name=${encodeURIComponent(sName)}&timeMax=now`);
   if (error) return { error: `Could not reach EliteBGS: ${error}` };
-  const json = await res.json();
-  const doc = json?.docs?.[0];
+  let json;
+  try { json = await res.json(); } catch { return { error: "EliteBGS JSON parse error (systems)." }; }
+  const doc = safeDocs(json)[0];
   if (!doc) return { error: `System not found: ${sName}` };
 
   const factions = doc.factions || doc.faction_presence || doc.presences || [];
@@ -157,7 +195,7 @@ async function callInara(eventName, eventData){
   const body = {
     header: {
       appName: "SpaceForce-IntelApplet",
-      appVersion: "1.2.0",
+      appVersion: "1.3.0",
       isBeingDeveloped: false,
       APIkey: "{{INARA_API_KEY}}"
     },
@@ -170,7 +208,8 @@ async function callInara(eventName, eventData){
     body: JSON.stringify(body)
   });
   if (!res.ok) return { error: `INARA HTTP ${res.status}` };
-  const json = await res.json();
+  let json;
+  try { json = await res.json(); } catch { return { error: "INARA JSON parse error." }; }
   const ev = json?.events?.[0];
   if (!ev) return { error: "Malformed INARA response." };
   return { event: ev };
@@ -202,17 +241,14 @@ function formatCmdr(ev){
 }
 
 // ---------------------------- Intentless Natural-Language Router ----------------------------
-// If LLM forgets intent, we’ll infer it from q (user’s natural text).
 function parseQuery(qRaw){
   const q = (qRaw || "").toLowerCase();
 
-  // quick detects
   const mentionsSystem = (() => {
     for (const key of Object.keys(SYSTEM_ALIASES)){
       if (q.includes(key)) return SYSTEM_ALIASES[key];
     }
-    // crude pattern for LTT ####
-    const m = q.match(/\bltt\s*([0-9]{4,5})\b/);
+    const m = q.match(/\bltt[-\s]?([0-9]{4,5})\b/);
     if (m) return `LTT ${m[1]}`;
     return null;
   })();
@@ -220,18 +256,15 @@ function parseQuery(qRaw){
   const mentionsFaction = (() => {
     if (q.includes("black sun crew")) return "Black Sun Crew";
     if (q.includes("oblivion fleet")) return "Oblivion Fleet";
-    if (q.includes("space force")) return "Space Force"; // squadron context sometimes asked like faction
+    if (q.includes("space force")) return "Space Force";
     return null;
   })();
 
   const mentionsCmdr = (() => {
-    // Look for "cmdr <name>" or "commander <name>"
     let m = q.match(/\bcmdr\s+([a-z0-9 _\-]+)\b/i) || q.match(/\bcommander\s+([a-z0-9 _\-]+)\b/i);
     if (m) return m[1].trim();
-    // Fallback for "check <name> on inara"
     m = q.match(/\bcheck\s+([a-z0-9 _\-]+)\s+on\s+inara\b/i);
     if (m) return m[1].trim();
-    // Explicit known name
     if (q.includes("jerome archer")) return "Jerome Archer";
     return null;
   })();
@@ -243,7 +276,6 @@ function parseQuery(qRaw){
   const wantsCmdrProfile = /inara|profile|rank|ranks|pilot|cm?dr|commander/i.test(q);
   const wantsPing = /\bping\b|\bhealth\b|\bstatus check\b|\btick\b/i.test(q);
 
-  // Route
   if (wantsPing) return { intent: "bgs_ping" };
   if (mentionsCmdr && wantsSquadronLink) return { intent: "squadron_quicklink", name: mentionsCmdr };
   if (mentionsCmdr && wantsCmdrProfile) return { intent: "commander_profile", name: mentionsCmdr };
@@ -252,38 +284,32 @@ function parseQuery(qRaw){
   if ((wantsInfluence || wantsStates) && mentionsFaction)
     return { intent: "faction_status", faction: mentionsFaction };
 
-  // If only a system is present, default to system snapshot
   if (mentionsSystem) return { intent: "system_status", system: mentionsSystem };
-  // If only a faction is present, default to faction status
   if (mentionsFaction) return { intent: "faction_status", faction: mentionsFaction };
-  // If only a commander is present, default to commander profile
   if (mentionsCmdr) return { intent: "commander_profile", name: mentionsCmdr };
 
-  // Give up — ask the LLM to provide inputs next time
   return { intent: "unknown" };
 }
 
 // ---------------------------- Main ----------------------------
 export async function run(input){
   try{
-    // 0) Optional connectivity check
+    // Health check
     if (input?.intent === "bgs_ping"){
       const { res, error, base } = await bgsFetch("/ticks");
       if (error) return `BGS ping failed: ${error}`;
-      const data = await res.json();
+      let data; try { data = await res.json(); } catch { /* ignore */ }
       return `BGS OK via ${base} (last tick docs: ${Array.isArray(data?.docs) ? data.docs.length : "?"})`;
     }
 
-    // 1) If LLM passed explicit intent, trust it; else parse q
+    // Route by explicit intent or natural-language `q`
     let intent = (input?.intent || "").toLowerCase();
     if (!intent || intent === "unknown"){
       const routed = parseQuery(input?.q || "");
       intent = routed.intent;
-      // copy back any inferred fields if not provided
       input = { ...input, ...routed };
     }
 
-    // 2) Execute
     if (intent === "commander_profile"){
       const name = canonicalizeName(norm(input?.name));
       if (!okStr(name)) return "Please provide a CMDR name.";
@@ -305,9 +331,12 @@ export async function run(input){
 
     if (intent === "faction_status"){
       const faction = canonicalizeName(norm(input?.faction));
+      const systemFilter = canonicalizeSystem(norm(input?.system)); // NEW: accept optional system filter
       if (!okStr(faction)) return "Please provide a faction name.";
-      const out = await bgsFactionStatus(faction);
-      return out.error ? out.error : out.text;
+      const out = await bgsFactionStatus(faction, systemFilter);
+      if (out.error) return out.error;
+      // If a system filter was used we returned JSON; otherwise text.
+      return out.json ? JSON.stringify(out.json) : out.text;
     }
 
     if (intent === "system_status"){
@@ -315,12 +344,10 @@ export async function run(input){
       if (!okStr(system)) return "Please provide a system name.";
       const out = await bgsSystemStatus(system);
       if (out.error) return out.error;
-      // Return JSON string so LLM can format naturally for Discord
       return JSON.stringify(out.json);
     }
 
-    // If we still don't know what to do:
-    return "Unknown request. Try: commander_profile, faction_status, system_status, or include a natural sentence in `q`.";
+    return "Unknown request. Try: commander_profile, faction_status (optionally with system), system_status — or include a natural sentence in `q`.";
   }catch(e){
     console.log("Applet error:", e?.message);
     return "Unexpected error inside the applet.";
