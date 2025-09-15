@@ -1,71 +1,145 @@
 // applet.js
-// Minimal INARA fetcher for AICord Applets
-// Expects: { cmdr: "Exact CMDR Name" }
-// Uses secret: {{INARA_API_KEY}}  (set in AICord Dashboard)
+// AICord Applet: Space Force Intel (INARA + EliteBGS)
+// Secrets: {{INARA_API_KEY}} (set in AICord Applet -> Secrets)
 
-export async function run({ cmdr }) {
-  if (!cmdr || typeof cmdr !== "string") {
-    return "Please provide a CMDR name, e.g., `!inara cmdr Artie`.";
+const INARA_API = "https://inara.cz/inapi/v1/";
+const ELITEBGS_API = "https://elitebgs.app/ebgs/v5"; // v5 docs
+
+// Space Force custom rules (hardcoded truths you want the LLM to rely on)
+const SPACEFORCE_OVERRIDES = {
+  ltt14850: {
+    "Black Sun Crew": {
+      cannotRetreat: true,
+      note: "Home system rule: Black Sun Crew cannot retreat in LTT 14850."
+    }
   }
+};
 
+function okStr(x){ return typeof x==="string" && x.trim().length>0; }
+function nowISO(){ return new Date().toISOString(); }
+
+async function callInara(eventName, eventData) {
   const body = {
     header: {
-      appName: "SpaceForce-InaraApplet",
+      appName: "SpaceForce-IntelApplet",
       appVersion: "1.0.0",
       isBeingDeveloped: false,
-      // For read-only events, INARA supports a generic *application* key,
-      // or you can use a user's personal API key. We inject ours as a secret:
       APIkey: "{{INARA_API_KEY}}"
     },
-    events: [
-      {
-        eventName: "getCommanderProfile",
-        eventTimestamp: new Date().toISOString(),
-        eventData: { searchName: cmdr }
-      }
-    ]
+    events: [{ eventName, eventTimestamp: nowISO(), eventData }]
   };
 
-  try {
-    const res = await fetch("https://inara.cz/inapi/v1/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      // Be a good citizen; INARA dev guide asks for reasonable timeouts/retries.
-    });
+  const res = await fetch(INARA_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) return { error: `INARA HTTP ${res.status}` };
+  const json = await res.json();
+  const ev = json?.events?.[0];
+  if (!ev) return { error: "Malformed INARA response." };
+  return { event: ev };
+}
 
-    const data = await res.json();
+function formatCmdr(ev) {
+  if (ev.eventStatus === 204) return "No results found on INARA for that CMDR.";
+  if (ev.eventStatus !== 200) {
+    return `INARA error ${ev.eventStatus ?? "?"}: ${ev.eventStatusText ?? "Unexpected response."}`;
+  }
+  const d = ev.eventData || {};
+  const name = d.commanderName || d.userName || "Unknown CMDR";
 
-    // Basic error handling per INARA's eventStatus
-    const ev = (data?.events && data.events[0]) || {};
-    if (ev.eventStatus === 200 && ev.eventData) {
-      const d = ev.eventData;
-      const ranks =
-        d.commanderRanksPilot
-          ?.map(r => `${r.rankName}: ${r.rankValue}${r.rankProgress != null ? ` (${Math.round(r.rankProgress*100)}%)` : ""}`)
-          .join(", ") || "N/A";
+  const ranks = Array.isArray(d.commanderRanksPilot) && d.commanderRanksPilot.length
+    ? d.commanderRanksPilot
+        .map(r => `${r.rankName}: ${r.rankValue}${r.rankProgress!=null?` (${Math.round(r.rankProgress*100)}%)`:""}`)
+        .join(", ")
+    : "N/A";
 
-      const squad = d.commanderSquadron?.SquadronName
-        ? `${d.commanderSquadron.SquadronName} (${d.commanderSquadron.SquadronMembersCount})`
-        : "N/A";
+  const squad = d.commanderSquadron?.SquadronName
+    ? `${d.commanderSquadron.SquadronName} (${d.commanderSquadron.SquadronMembersCount})`
+    : "N/A";
 
-      return [
-        `**${d.userName}** ${d.commanderName ? `(CMDR ${d.commanderName})` : ""}`,
-        `Ranks: ${ranks}`,
-        `Squadron: ${squad}`,
-        d.inaraURL ? `INARA: ${d.inaraURL}` : ""
-      ].filter(Boolean).join("\n");
+  const squadURL = d.commanderSquadron?.inaraURL || "";
+  const profileURL = d.inaraURL || "";
+
+  return [
+    `**${name}**`,
+    `Ranks: ${ranks}`,
+    `Squadron: ${squad}`,
+    squadURL ? `Squadron page: ${squadURL}` : "",
+    profileURL ? `INARA profile: ${profileURL}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+// --- EliteBGS helpers ---
+async function bgsFactionStatus(factionName){
+  const url = `${ELITEBGS_API}/factions?name=${encodeURIComponent(factionName)}&timeMax=now`;
+  const res = await fetch(url);
+  if (!res.ok) return { error: `EliteBGS HTTP ${res.status}` };
+  const json = await res.json();
+
+  const f = json?.docs?.[0];
+  if (!f) return { text: "Faction not found on EliteBGS." };
+
+  // Build quick digest: states and influence per system
+  const lines = [];
+  lines.push(`**${f.name}** — Allegiance: ${f.allegiance || "Unknown"} | Gov: ${f.government || "Unknown"}`);
+  if (Array.isArray(f.faction_presence)) {
+    for (const p of f.faction_presence) {
+      const sys = p.system_name;
+      const inf = (p.influence!=null) ? `${(p.influence*100).toFixed(1)}%` : "N/A";
+      const states = [
+        ...(p.active_states||[]).map(s=>s.state),
+        ...(p.pending_states||[]).map(s=>`pending:${s.state}`),
+        ...(p.recovering_states||[]).map(s=>`recovering:${s.state}`)
+      ];
+      // Apply Space Force overrides where relevant
+      const override = (sys && sys.toLowerCase()==="ltt 14850")
+        ? SPACEFORCE_OVERRIDES.ltt14850?.[f.name] : null;
+
+      lines.push(`• ${sys}: influence ${inf}${states.length?` | states: ${states.join(", ")}`:""}${override?.cannotRetreat?` | NOTE: ${override.note}`:""}`);
+    }
+  }
+  return { text: lines.join("\n") };
+}
+
+export async function run(input){
+  try{
+    const intent = (input?.intent||"").toLowerCase();
+
+    // 1) Commander profile (INARA)
+    if (intent === "commander_profile") {
+      const name = input?.name;
+      if (!okStr(name)) return "Please provide a CMDR name.";
+      const { error, event } = await callInara("getCommanderProfile", { searchName: name });
+      if (error) return `Could not reach INARA: ${error}`;
+      return formatCmdr(event);
     }
 
-    if (ev.eventStatus === 204) {
-      return "No results found on INARA for that CMDR.";
+    // 2) Faction status (EliteBGS) - e.g., "Black Sun Crew"
+    if (intent === "faction_status") {
+      const faction = input?.faction;
+      if (!okStr(faction)) return "Please provide a faction name.";
+      const out = await bgsFactionStatus(faction);
+      return out.error ? `Could not reach EliteBGS: ${out.error}` : out.text;
     }
 
-    const status = ev.eventStatus ?? data?.header?.eventStatus;
-    const msg = ev.eventStatusText ?? "Unexpected response from INARA.";
-    return `INARA error ${status ?? ""}: ${msg}`;
-  } catch (err) {
-    console.log("INARA fetch error:", err?.message);
-    return "Could not reach INARA right now. Try again in a bit.";
+    // 3) Squadron quicklink (by any CMDR known to be in that squad)
+    if (intent === "squadron_quicklink") {
+      const name = input?.name;
+      if (!okStr(name)) return "Please provide a CMDR name to infer the squadron.";
+      const { error, event } = await callInara("getCommanderProfile", { searchName: name });
+      if (error) return `Could not reach INARA: ${error}`;
+      if (event.eventStatus !== 200) return "No squadron info found for that CMDR.";
+      const d = event.eventData || {};
+      const sq = d.commanderSquadron;
+      if (sq?.inaraURL) return `**${sq.SquadronName}** — ${sq.inaraURL}`;
+      return "No squadron link available.";
+    }
+
+    return "Unknown request. Try one of: commander_profile, faction_status, squadron_quicklink.";
+  } catch(e){
+    console.log("Applet error:", e?.message);
+    return "Unexpected error inside the applet.";
   }
 }
