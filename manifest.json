@@ -1,21 +1,56 @@
 {
-  "toolMetadata": {
-    "name": "spaceforceIntel",
-    "description": "Live intel: INARA commander lookups + EliteBGS faction/system status (with Space Force overrides).",
-    "appletID": "auto",
-    "visibility": "public",
-    "repo": "Benjanesvi/aicord-spaceforce-intel",
-    "codePath": "applet.js",
-    "branch": "main"
-  },
+  "name": "spaceforceIntel",
+  "description": "Live intel for Elite Dangerous: INARA commander profiles + EliteBGS faction & system status (with Space Force overrides). Accepts plain language via `q` or explicit intents.",
+  "visibility": "public",
   "input": {
     "intent": "string",
     "name": "string",
     "faction": "string",
-    "system": "string"
+    "system": "string",
+    "q": "string",
+    "verbose": "boolean"
   },
-  "triggers": [],
-  "secrets": {
-    "INARA_API_KEY": "set-in-aicord-dashboard"
-  }
+  "triggers": [
+    "bgs",
+    "tick",
+    "system snapshot",
+    "system status",
+    "what's happening in",
+    "status of",
+    "overview",
+    "influence",
+    "who controls",
+    "who owns",
+    "percent",
+    "share",
+    "states",
+    "boom",
+    "war",
+    "civil war",
+    "election",
+    "expansion",
+    "retreat",
+    "pending",
+    "recovering",
+    "elitebgs",
+    "check inara",
+    "inara profile",
+    "commander profile",
+    "cmDR",
+    "commander",
+    "pilot",
+    "ranks",
+    "squadron",
+    "squadron link",
+    "which squadron",
+    "what squadron",
+    "Space Force",
+    "Black Sun Crew",
+    "Oblivion Fleet",
+    "Jerome Archer",
+    "LTT 14850",
+    "14850",
+    "Guragwe",
+    "Alrai Sector FW-V b2-2"
+  ]
 }
