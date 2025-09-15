@@ -1,1 +1,21 @@
-
+{
+  "toolMetadata": {
+    "name": "spaceforceIntel",
+    "description": "Live intel: INARA commander lookups + EliteBGS faction/system status (with Space Force overrides).",
+    "appletID": "auto",
+    "visibility": "public",
+    "repo": "Benjanesvi/aicord-spaceforce-intel",
+    "codePath": "applet.js",
+    "branch": "main"
+  },
+  "input": {
+    "intent": "string",
+    "name": "string",
+    "faction": "string",
+    "system": "string"
+  },
+  "triggers": [],
+  "secrets": {
+    "INARA_API_KEY": "set-in-aicord-dashboard"
+  }
+}
