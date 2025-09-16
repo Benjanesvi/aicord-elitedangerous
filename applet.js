@@ -1,40 +1,48 @@
 // applet.js
-// SpaceForce Intel Applet (v5.1) — by/for Benjanesvi
-// Live intel: EliteBGS (primary) + EDSM (fallback); Commanders via INARA; BGS guide archive via GitHub RAW
-// Lore-friendly output, never guess numbers, allow stale data with timestamp, optional markets relay
+// SpaceForce Intel Applet — DeepSeek-tuned (v5.3 with advanced caching)
+// Primary: EliteBGS v5 (faction boards). Fallback/extra: EDSM (system, stations, bodies, traffic/deaths).
+// INARA: commander profiles only. Archive (BGS guide) from your GitHub raw JSON.
+// Lore-friendly outputs. Never invent numbers. Allow stale with timestamps. Strong NLU router + diagnostics + robust cache.
 
-// ========= CONFIG =========
 const APP_NAME = "SpaceForce-IntelApplet";
-const APP_VERSION = "5.1.0";
+const APP_VERSION = "5.3.0";
 
-// Data sources
+// ---------- Data sources ----------
 const INARA_API = "https://inara.cz/inapi/v1/";
-const ELITEBGS_API = "https://elitebgs.app/api/ebgs/v5";      // primary for faction/system boards
-const EDSM_SYS_API = "https://www.edsm.net/api-v1";            // fallback/system info
-const EDSM_SYSTEM_API = "https://www.edsm.net/api-system-v1";  // fallback boards/stations/bodies/activity
+const ELITEBGS_API = "https://elitebgs.app/api/ebgs/v5";      // factions/systems (presence, influence, states)
+const EDSM_SYS_API = "https://www.edsm.net/api-v1";            // system info
+const EDSM_SYSTEM_API = "https://www.edsm.net/api-system-v1";  // factions (fallback), stations/bodies/activity
 
-// Archive (from your repo)
+// ---------- Archive JSON (GitHub RAW) ----------
 const RAW = "https://raw.githubusercontent.com/Benjanesvi/aicord-elitedangerous/main/data";
 const BGS_CHUNKS_URL = `${RAW}/bgs_chunks.json`;
 const BGS_INDEX_URL  = `${RAW}/bgs_index.json`;
 
-// Optional: market relay (leave "" to disable)
+// Optional market relay (leave "" to disable)
 const MARKET_API_BASE = "";
 
-// Behavior flags
+// Behavior
 const LORE_ERRORS = true;
-const ALLOW_STALE = true;
+const ALLOW_STALE = true;              // do not block if data is old; append timestamp
 const SHOW_TEACH_SNIPPETS = true;
 const HTTP_TIMEOUT_MS = 12000;
 const MAX_LINES = 16;
 
-// Admins (simple debug gate)
 const ADMINS = new Set(["Benjanesvi"]);
+const UA = { "User-Agent": `${APP_NAME}/${APP_VERSION} (+EliteBGS+EDSM+INARA)` };
 
-// Headers
-const UA = { "User-Agent": `${APP_NAME}/${APP_VERSION} (+EDSM+EliteBGS+INARA)` };
+// ---- Cache tuning ----
+const CACHE_MAX_ENTRIES = 1000;               // overall cap (LRU)
+const TTL = {
+  bgs:     3 * 60 * 1000,     // 3m — EliteBGS boards update often
+  edsm:    5 * 60 * 1000,     // 5m — systems/stations/bodies/activity
+  inara:  15 * 60 * 1000,     // 15m — commander profiles change rarely
+  archive:24 * 60 * 60 * 1000,// 24h — static guide
+  market:  1 * 60 * 1000      // 1m — if you enable a market relay
+};
+const NEG_TTL_MS = 2 * 60 * 1000; // negative cache (404/204) to avoid hammering
 
-// ========= CANONICALIZATION =========
+// ---------- Canonicalization ----------
 const CANONICAL_NAMES = {
   "black sun crew": "Black Sun Crew",
   "space force": "Space Force",
@@ -54,7 +62,7 @@ const SPACEFORCE_OVERRIDES = {
   ltt14850: { "Black Sun Crew": { note: "Black Sun Crew cannot retreat in LTT 14850 (home system)." } }
 };
 
-// ========= UTIL =========
+// ---------- Utils ----------
 function norm(s){ return typeof s==="string" ? s.trim() : s; }
 function okStr(s){ return typeof s==="string" && s.trim().length>0; }
 function nowISO(){ return new Date().toISOString(); }
@@ -96,24 +104,135 @@ function extractTimestamp(...objs){
 }
 function bullets(items){ return items.filter(Boolean).map(s=>s.startsWith("•")?s:`• ${s}`).join("\n"); }
 
-// Simple cache + rate guard
-const CACHE = new Map(); const CACHE_TTL_MS = 60_000;
-function cacheGet(k){ const v=CACHE.get(k); if(!v) return null; if(Date.now()-v.ts>CACHE_TTL_MS){ CACHE.delete(k); return null; } return v.data; }
-function cacheSet(k,data){ CACHE.set(k,{ts:Date.now(),data}); }
+// ---- LRU Cache with TTL + negative caching + stale-on-error ----
+const _CACHE = new Map(); // key -> {ts, ttl, data, ok, status, etag, lastMod}
+
+// promote key to most-recent
+function _touchLRU(key) {
+  const val = _CACHE.get(key);
+  if (val !== undefined) {
+    _CACHE.delete(key);
+    _CACHE.set(key, val);
+  }
+}
+
+function cacheGetFresh(key) {
+  const v = _CACHE.get(key);
+  if (!v) return null;
+  const fresh = (Date.now() - v.ts) <= v.ttl;
+  if (fresh) _touchLRU(key);
+  return fresh ? v : null;
+}
+function cacheGetAny(key) {
+  const v = _CACHE.get(key);
+  if (!v) return null;
+  _touchLRU(key);
+  return v; // may be stale
+}
+function cacheSet(key, payload) {
+  // payload: { data, ttl, ok, status, etag?, lastMod? }
+  _CACHE.set(key, { ...payload, ts: Date.now() });
+  // LRU prune
+  while (_CACHE.size > CACHE_MAX_ENTRIES) {
+    const firstKey = _CACHE.keys().next().value;
+    _CACHE.delete(firstKey);
+  }
+}
+
+// Generic cached JSON GET (supports ETag/Last-Modified; stale-on-error)
+async function fetchJSONCached(url, bucket, opts = {}) {
+  const ttl = TTL[bucket] ?? (5 * 60 * 1000);
+  const key = `${bucket}:${url}`;
+  const fresh = cacheGetFresh(key);
+  if (fresh) return { json: fresh.data, stale: false, status: fresh.status };
+
+  const stale = cacheGetAny(key);
+
+  try {
+    const headers = { ...(opts.headers||{}), ...UA };
+    if (stale?.etag) headers["If-None-Match"] = stale.etag;
+    if (stale?.lastMod) headers["If-Modified-Since"] = stale.lastMod;
+
+    const res = await fetchWithTimeout(url, { ...opts, headers });
+
+    if (res.status === 304 && stale) {
+      cacheSet(key, { data: stale.data, ttl, ok: true, status: 200, etag: stale.etag, lastMod: stale.lastMod });
+      return { json: stale.data, stale: false, status: 200 };
+    }
+
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 204) {
+        cacheSet(key, { data: null, ttl: NEG_TTL_MS, ok: false, status: res.status });
+      }
+      if (stale && ALLOW_STALE) {
+        return { json: stale.data, stale: true, status: stale.status ?? 200 };
+      }
+      return { error: "network", status: res.status };
+    }
+
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); }
+    catch {
+      if (stale && ALLOW_STALE) return { json: stale.data, stale: true, status: stale.status ?? 200 };
+      return { error: "parse" };
+    }
+
+    cacheSet(key, {
+      data: json, ttl, ok: true, status: res.status,
+      etag: res.headers.get("ETag") || undefined,
+      lastMod: res.headers.get("Last-Modified") || undefined
+    });
+    return { json, stale: false, status: res.status };
+  } catch {
+    if (stale && ALLOW_STALE) return { json: stale.data, stale: true, status: stale.status ?? 200 };
+    return { error: "network" };
+  }
+}
+
+// Cache-aware rate guard
 const RATE = new Map();
 function rateOk(who="guild"){ const now=Date.now(); const arr=(RATE.get(who)||[]).filter(t=>now-t<5000); arr.push(now); RATE.set(who,arr); return arr.length<=6; }
 
-// ========= INARA (commanders) =========
-async function inara(eventName, eventData){
-  const body = { header:{ appName:APP_NAME, appVersion:APP_VERSION, isBeingDeveloped:false, APIkey:"{{INARA_API_KEY}}" },
-                 events:[{ eventName, eventTimestamp:nowISO(), eventData }] };
-  try{
-    const res = await fetchWithTimeout(INARA_API, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-    if(!res.ok) return { error:"network", status: res.status };
-    const txt = await res.text(); let json; try{ json=JSON.parse(txt); }catch{ return { error:"parse" }; }
-    const ev = json?.events?.[0]; if(!ev) return { error:"parse" };
-    return { event: ev };
-  }catch{ return { error:"network" }; }
+// ---------- INARA (commanders only; memoized) ----------
+async function inaraCommanderProfile(searchName){
+  const key = `inara:cmdr:${searchName.toLowerCase()}`;
+  const ttl = TTL.inara;
+  const fresh = cacheGetFresh(key);
+  if (fresh) return { event: fresh.data, stale: false };
+
+  const stale = cacheGetAny(key);
+
+  const body = {
+    header: { appName: APP_NAME, appVersion: APP_VERSION, isBeingDeveloped: false, APIkey: "{{INARA_API_KEY}}" },
+    events: [{ eventName: "getCommanderProfile", eventTimestamp: nowISO(), eventData: { searchName } }]
+  };
+
+  try {
+    const res = await fetchWithTimeout(INARA_API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      if ((res.status === 404 || res.status === 204)) {
+        cacheSet(key, { data: null, ttl: NEG_TTL_MS, ok: false, status: res.status });
+      }
+      if (stale && ALLOW_STALE) return { event: stale.data, stale: true };
+      return { error: "network", status: res.status };
+    }
+    const text = await res.text();
+    let json; try { json = JSON.parse(text); } catch {
+      if (stale && ALLOW_STALE) return { event: stale.data, stale: true };
+      return { error: "parse" };
+    }
+    const ev = json?.events?.[0];
+    cacheSet(key, { data: ev, ttl, ok: true, status: 200 });
+    return { event: ev, stale: false };
+  } catch {
+    if (stale && ALLOW_STALE) return { event: stale.data, stale: true };
+    return { error: "network" };
+  }
 }
 function formatCommander(ev){
   if(!ev || ev.eventStatus===204) return loreErrorLine("notfound");
@@ -128,15 +247,8 @@ function formatCommander(ev){
   return bullets([`**${name}**`,`Ranks: ${ranks}`,`Squadron: ${squad}`, ql&&`Squadron page: ${ql}`, url&&`INARA profile: ${url}`]);
 }
 
-// ========= EDSM (fallback + stations/bodies/activity) =========
-async function edsmJSON(url){
-  const key=`edsm:${url}`; const hit=cacheGet(key); if(hit) return { json: hit };
-  try{
-    const res = await fetchWithTimeout(url,{headers:UA}); if(!res.ok) return { error:"network", status:res.status };
-    const txt = await res.text(); let json; try{ json=JSON.parse(txt); }catch{ return { error:"parse" }; }
-    cacheSet(key,json); return { json };
-  }catch{ return { error:"network" }; }
-}
+// ---------- EDSM (fallback + stations/bodies/activity; cached) ----------
+async function edsmJSON(url){ return fetchJSONCached(url, "edsm"); }
 async function edsmSystem(system){ const s=encodeURIComponent(system);
   return edsmJSON(`${EDSM_SYS_API}/system?systemName=${s}&showInformation=1&showPrimaryStar=1&showCoordinates=1&showPermit=1`); }
 async function edsmSystemFactions(system){ const s=encodeURIComponent(system); return edsmJSON(`${EDSM_SYSTEM_API}/factions?systemName=${s}`); }
@@ -145,15 +257,8 @@ async function edsmSystemBodies(system){ const s=encodeURIComponent(system); ret
 async function edsmTraffic(system){ const s=encodeURIComponent(system); return edsmJSON(`${EDSM_SYSTEM_API}/traffic?systemName=${s}`); }
 async function edsmDeaths(system){ const s=encodeURIComponent(system); return edsmJSON(`${EDSM_SYSTEM_API}/deaths?systemName=${s}`); }
 
-// ========= EliteBGS (primary for boards) =========
-async function bgsJSON(url){
-  const key=`bgs:${url}`; const hit=cacheGet(key); if(hit) return { json: hit };
-  try{
-    const res = await fetchWithTimeout(url,{headers:UA}); if(!res.ok) return { error:"network", status:res.status };
-    const txt = await res.text(); let json; try{ json=JSON.parse(txt); }catch{ return { error:"parse" }; }
-    cacheSet(key,json); return { json };
-  }catch{ return { error:"network" }; }
-}
+// ---------- EliteBGS (primary boards; cached) ----------
+async function bgsJSON(url){ return fetchJSONCached(url, "bgs"); }
 async function bgsSystem(system){ const s=encodeURIComponent(system); return bgsJSON(`${ELITEBGS_API}/systems?name=${s}`); }
 async function bgsFaction(faction){ const f=encodeURIComponent(faction); return bgsJSON(`${ELITEBGS_API}/factions?name=${f}`); }
 
@@ -188,7 +293,7 @@ function pickFactionInSystemFromBgs(factionName, bgsFactionDoc, systemName){
   };
 }
 
-// ========= FORMATTERS =========
+// ---------- Formatters ----------
 function formatSystemSnapshot(sysDoc, factionsDoc){
   if(!sysDoc || sysDoc.name==null) return loreErrorLine("notfound");
   const info=sysDoc.information||{};
@@ -253,7 +358,7 @@ function formatTrafficDeaths(systemName, trafficDoc, deathsDoc){
   return appendTickLine(`**${systemName} — Activity**\n• Traffic: ${tDay} (24h), ${tWeek} (7d)\n• Deaths: ${dDay} (24h), ${dWeek} (7d)`, extractTimestamp(trafficDoc, deathsDoc));
 }
 
-// ========= ARCHIVE (BGS Guide) =========
+// ---------- Archive (BGS Guide; cached) ----------
 let BGS_ARCHIVE=null;
 function _tok(s){ return (s||"").toLowerCase().replace(/[^a-z0-9\s\-]/g," ").split(/\s+/).filter(w=>w.length>2); }
 function _idfScore(qTokens,text,idf){ const words=_tok(text), tf={}; for(const w of words) tf[w]=(tf[w]||0)+1; let s=0; for(const q of qTokens) s+=(tf[q]||0)*(idf[q]||1); return s/Math.sqrt(words.length||1); }
@@ -261,10 +366,14 @@ function highlight(s,terms){ let out=s; for(const t of terms){ const re=new RegE
 async function loadArchive(){
   if(BGS_ARCHIVE) return BGS_ARCHIVE;
   try{
-    const [cRes,iRes]=await Promise.all([fetchWithTimeout(BGS_CHUNKS_URL,{headers:UA}), fetchWithTimeout(BGS_INDEX_URL,{headers:UA})]);
-    const chunks=JSON.parse(await cRes.text()); const idx=JSON.parse(await iRes.text());
+    const c = await fetchJSONCached(BGS_CHUNKS_URL, "archive");
+    const i = await fetchJSONCached(BGS_INDEX_URL, "archive");
+    const chunks = c.json || [];
+    const idx = i.json || {};
     BGS_ARCHIVE={chunks, idf:idx.idf||{}, N:idx.N||chunks.length}; return BGS_ARCHIVE;
-  }catch{ return { chunks:[], idf:{}, N:0 }; }
+  }catch{
+    return { chunks:[], idf:{}, N:0 };
+  }
 }
 async function archiveSearch(query,limit=5){
   const {chunks,idf}=await loadArchive(); const terms=_tok(query);
@@ -278,28 +387,25 @@ async function archiveSearch(query,limit=5){
   return scored;
 }
 
-// ========= OPTIONAL MARKETS =========
-async function marketFor(system,station){
-  if(!MARKET_API_BASE) return { error:"disabled" };
-  try{
-    const url=`${MARKET_API_BASE}/market?system=${encodeURIComponent(system)}&station=${encodeURIComponent(station)}`;
-    const res=await fetchWithTimeout(url); if(!res.ok) return { error:"network", status:res.status };
-    return { json: await res.json() };
-  }catch{ return { error:"network" }; }
+// ---------- Markets (optional relay; cached) ----------
+async function marketFor(system, station){
+  if (!MARKET_API_BASE) return { error: "disabled" };
+  const url = `${MARKET_API_BASE}/market?system=${encodeURIComponent(system)}&station=${encodeURIComponent(station)}`;
+  return fetchJSONCached(url, "market");
 }
-async function commodityNear(commodity,near,maxLy=30){
-  if(!MARKET_API_BASE) return { error:"disabled" };
-  try{
-    const url=`${MARKET_API_BASE}/find?commodity=${encodeURIComponent(commodity)}&near=${encodeURIComponent(near)}&maxLy=${encodeURIComponent(maxLy)}`;
-    const res=await fetchWithTimeout(url); if(!res.ok) return { error:"network", status:res.status };
-    return { json: await res.json() };
-  }catch{ return { error:"network" }; }
+async function commodityNear(commodity, near, maxLy=30){
+  if (!MARKET_API_BASE) return { error: "disabled" };
+  const url = `${MARKET_API_BASE}/find?commodity=${encodeURIComponent(commodity)}&near=${encodeURIComponent(near)}&maxLy=${encodeURIComponent(maxLy)}`;
+  return fetchJSONCached(url, "market");
 }
 
-// ========= NLU ROUTER =========
+// ---------- NLU router (DeepSeek-friendly) ----------
 function parseQuery(qRaw){
   const q=(qRaw||"").toLowerCase();
-  if(/\bdebug|diag|diagnostic\b/.test(q)) return { intent:"debug" };
+
+  // Forced router keywords for testing / forcing runs
+  if(/^ping$/.test(q)) return { intent:"bgs_ping" };
+  if(/^diag\b|^debug\b|diagnostic/.test(q)) return { intent:"debug" };
 
   const mCmdr = q.match(/\b(?:cmdr|commander)\s+([a-z0-9 _\-]+)\b/i);
   if(mCmdr) return { intent:"commander_profile", name:mCmdr[1].trim() };
@@ -346,8 +452,10 @@ function parseQuery(qRaw){
   return { intent:"unknown" };
 }
 
-// ========= MAIN =========
+// ---------- MAIN ----------
 export async function run(input){
+  console.log(`[${APP_NAME}] v${APP_VERSION} input=`, JSON.stringify(input||{}, null, 2));
+
   try{
     if(!rateOk("guild")) return "Comms are saturated. One at a time, and we’ll get you your snapshot.";
 
@@ -357,17 +465,27 @@ export async function run(input){
 
     const debugRequested=/\bdebug|diag|diagnostic\b/i.test(rawQ);
     const isAdmin=Array.from(ADMINS).some(nm=>(rawQ||"").toLowerCase().includes(nm.toLowerCase())) || Boolean(input?.debug);
+
+    // Health check
+    if(intent==="bgs_ping") return `Applet online — ${APP_NAME} v${APP_VERSION}`;
+
+    // Cache / LRU stats (optional)
+    if (/^cache stats?$/.test((input?.q||"").toLowerCase())) {
+      return `Cache entries: ${_CACHE.size} | Max: ${CACHE_MAX_ENTRIES}
+BGS TTL: ${TTL.bgs/60000}m | EDSM TTL: ${TTL.edsm/60000}m | INARA TTL: ${TTL.inara/60000}m | Archive TTL: ${TTL.archive/3600000}h`;
+    }
+
     if(debugRequested&&isAdmin) return "DEBUG " + JSON.stringify({ routed: input }, null, 2);
 
     // Commander (INARA)
     if(intent==="commander_profile"){
       const name=norm(input?.name); if(!okStr(name)) return loreErrorLine("notfound");
-      const { error, event } = await inara("getCommanderProfile",{ searchName:name });
-      if(error) return loreErrorLine(error);
-      return formatCommander(event);
+      const res = await inaraCommanderProfile(name);
+      if(res.error) return loreErrorLine(res.error);
+      return formatCommander(res.event);
     }
 
-    // System snapshot — prefer EliteBGS, fallback EDSM
+    // System snapshot — EliteBGS then EDSM
     if(intent==="system_status"){
       const sys=canonicalizeSystem(norm(input?.system)); if(!okStr(sys)) return loreErrorLine("notfound");
       const bgs=await bgsSystem(sys);
@@ -375,12 +493,12 @@ export async function run(input){
         const mapped=mapBgsSystemToSnapshot(bgs.json);
         return formatSystemSnapshot(mapped.sysDoc, mapped.facDoc);
       }
-      const [{json:sysDoc,e1},{json:facDoc,e2}] = await Promise.all([{...await edsmSystem(sys), e1:undefined}, {...await edsmSystemFactions(sys), e2:undefined}]);
-      if(e1 && !ALLOW_STALE) return loreErrorLine("network");
-      return formatSystemSnapshot(sysDoc||{name:sys}, e2?null:facDoc);
+      const [sysRes,facRes]=await Promise.all([edsmSystem(sys),edsmSystemFactions(sys)]);
+      if(sysRes.error && !ALLOW_STALE) return loreErrorLine("network");
+      return formatSystemSnapshot(sysRes.json || { name: sys }, facRes.error ? null : facRes.json);
     }
 
-    // Faction status in system — EliteBGS first
+    // Faction status — EliteBGS first
     if(intent==="faction_status"){
       const sys=canonicalizeSystem(norm(input?.system||""));
       const faction=canonicalizeName(norm(input?.faction));
@@ -397,14 +515,14 @@ export async function run(input){
           }
           return formatFactionInSystem(sys, mapped.facDoc, faction);
         }
-        const { json:facDoc, error } = await edsmSystemFactions(sys);
-        if(error && !ALLOW_STALE) return loreErrorLine("network");
-        return formatFactionInSystem(sys, facDoc||{factions:[]}, faction);
+        const facFallback = await edsmSystemFactions(sys);
+        if(facFallback.error && !ALLOW_STALE) return loreErrorLine("network");
+        return formatFactionInSystem(sys, facFallback.json || {factions:[]}, faction);
       }
       return `Name the system for ${faction}, and I’ll pull their standing there.`;
     }
 
-    // Full system intel bundle
+    // Full intel bundle
     if(intent==="system_intel"){
       const sys=canonicalizeSystem(norm(input?.system)); if(!okStr(sys)) return loreErrorLine("notfound");
 
@@ -494,7 +612,7 @@ export async function run(input){
           const mapped=mapBgsSystemToSnapshot(bgs.json);
           preface=formatSystemSnapshot(mapped.sysDoc,mapped.facDoc)+`\n\n`;
         }else{
-          preface=loreErrorLine("network")+`\n(Attempted live read for **${system}**)\n\n`;
+          preface=loreErrorLine("network")+`\n(Attempted live read for **${system}**)`+"\n\n";
         }
       }
       const picks=await archiveSearch(q,5);
@@ -505,7 +623,8 @@ export async function run(input){
 
     // Fallback help
     return "Say the word. System intel, faction standing, stations, bodies, activity, a commander’s record, markets (if enabled), or the BGS archive for what/why/how.";
-  }catch(_e){
+  }catch(e){
+    console.log(`[${APP_NAME}] ERROR`, e?.stack || String(e));
     return loreErrorLine("unknown");
   }
 }
