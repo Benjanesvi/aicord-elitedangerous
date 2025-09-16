@@ -7,7 +7,7 @@ const EBGS_BASE = "https://elitebgs.app/ebgs";
 
 const env = (k, d) => (process.env[k] ? String(process.env[k]).trim() : d);
 
-// ------------ HTTP (tight timeout, no retries) ------------
+// ---------- HTTP (tight timeout, no retries) ----------
 async function http(url, options = {}, timeoutMs = 7000) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), timeoutMs);
@@ -24,7 +24,7 @@ async function http(url, options = {}, timeoutMs = 7000) {
   }
 }
 
-// ---------------- Inara (read-only) ----------------
+// ---------- Inara (read-only) ----------
 async function inaraCommanderProfile(name) {
   const payload = {
     header: {
@@ -53,35 +53,38 @@ async function inaraCommanderProfile(name) {
   return { data: ev.eventData };
 }
 
-// ---------------- EliteBGS (v5) ----------------
+// ---------- EliteBGS (v5) ----------
 const ebgsSystem = (name) => http(`${EBGS_BASE}/v5/systems?name=${encodeURIComponent(name)}`);
 const ebgsFaction = (name) => http(`${EBGS_BASE}/v5/factions?name=${encodeURIComponent(name)}`);
 const ebgsStationsBySystem = (name) => http(`${EBGS_BASE}/v5/stations?system=${encodeURIComponent(name)}`);
 
-// ---------------- EDSM ----------------
+// ---------- EDSM ----------
 const edsmSystem = (name) =>
   http(`${EDSM_BASE}/system?systemName=${encodeURIComponent(name)}&showId=1&showCoordinates=1&showInformation=1`);
 const edsmBodies = (name) => http(`${EDSM_BASE}/bodies?systemName=${encodeURIComponent(name)}`);
 
-// ---------------- BGS Guide (GitHub index/prefix, or local) ----------------
+// ---------- BGS Guide (GitHub index/prefix, or local) ----------
 async function readLocal(path) {
   try {
     const fs = await import("node:fs/promises");
     return await fs.readFile(path, "utf8");
-  } catch {
-    return null;
-  }
+  } catch { return null; }
+}
+function extract(text, key) {
+  if (!text) return null;
+  const lines = text.split(/\r?\n/).filter(l => l.toLowerCase().includes(key));
+  return lines.length ? lines.slice(0, 5).join("\n") : null;
 }
 async function guideLookup(keyword) {
   const k = keyword.toLowerCase();
-  // local file (mounted)
+
   const localPath = env("BGS_GUIDE_PATH");
   if (localPath) {
     const txt = await readLocal(localPath);
     const hit = extract(txt, k);
     if (hit) return hit;
   }
-  // index mode: JSON array of part URLs
+
   const indexUrl = env("BGS_GUIDE_INDEX_URL");
   const max = parseInt(env("BGS_GUIDE_MAX_PARTS") || "16", 10);
   if (indexUrl) {
@@ -96,7 +99,6 @@ async function guideLookup(keyword) {
       }
     }
   } else {
-    // prefix mode: prefix + 1..N .txt
     const prefix = env("BGS_GUIDE_PREFIX_URL");
     if (prefix) {
       for (let i = 1; i <= max; i++) {
@@ -110,13 +112,8 @@ async function guideLookup(keyword) {
   }
   return null;
 }
-function extract(text, key) {
-  if (!text) return null;
-  const lines = text.split(/\r?\n/).filter((l) => l.toLowerCase().includes(key));
-  return lines.length ? lines.slice(0, 5).join("\n") : null;
-}
 
-// ---------------- Intent routing (free language) ----------------
+// ---------- Intent routing ----------
 function routeIntent(s) {
   const text = s.toLowerCase().trim();
 
@@ -138,30 +135,26 @@ function routeIntent(s) {
   m = text.match(/^guide[: ]+\s*(.+)$/i);
   if (m) return { kind: "guide", arg: m[1].trim() };
 
-  // “<system> snapshot”
   m = text.match(/^(.+)\s+snapshot$/i);
   if (m) return { kind: "system_snapshot", arg: m[1].trim() };
 
-  // Fallback heuristic: looks like a system name → system snapshot
   if (/\w/.test(text)) return { kind: "system_snapshot", arg: s.trim() };
-
   return { kind: "help" };
 }
 
-// ---------------- Formatting helpers ----------------
+// ---------- Formatting ----------
 const field = (k, v) => `**${k}:** ${v}`;
 const cut = (s, n = 1800) => (!s || s.length <= n ? s : s.slice(0, n - 3) + "...");
 const num = (v) => (typeof v === "number" && isFinite(v) ? v.toFixed(1) : "n/a");
 const pct = (v) => (typeof v === "number" ? `${(v * 100).toFixed(1)}%` : "n/a");
-const statesStr = (arr) => (Array.isArray(arr) && arr.length ? arr.map((a) => a.state).join(", ") : "—");
+const statesStr = (arr) => (Array.isArray(arr) && arr.length ? arr.map(a => a.state).join(", ") : "—");
 
-// ---------------- Main entry (manifest expects {text}) ----------------
-async function run(input) {
+// ---------- REQUIRED EXPORT ----------
+export async function run(input) {
   const q = String(input?.text || "").trim();
   if (!q) {
     return {
-      text:
-        "Give me something to look up, e.g. `system snapshot for LTT 14850`, `faction Black Sun Crew`, `cmdr <name>`, `stations in Guragwe`, or `guide expansion`."
+      text: "Try: `system snapshot for LTT 14850`, `faction Black Sun Crew`, `cmdr <name>`, `stations in Guragwe`, `bodies in Maia`, or `guide expansion`."
     };
   }
 
@@ -179,7 +172,7 @@ async function run(input) {
       const bodiesCount = Array.isArray(bRes?.data?.bodies) ? bRes.data.bodies.length : "n/a";
       const eb = Array.isArray(ebRes?.data?.docs) ? ebRes.data.docs[0] : null;
       const control = eb?.controllingFaction || "n/a";
-      const states = eb?.factions?.map?.((f) => `${f.name}: ${statesStr(f.activeStates)}`).slice(0, 5).join(" • ") || "n/a";
+      const states = eb?.factions?.map?.(f => `${f.name}: ${statesStr(f.activeStates)}`).slice(0, 5).join(" • ") || "n/a";
 
       return {
         text: [
@@ -201,9 +194,7 @@ async function run(input) {
       const doc = Array.isArray(r.data?.docs) ? r.data.docs[0] : null;
       if (!doc) return { text: `No faction found named "${name}".` };
       const pres = (doc.faction_presence || doc.factionPresence || []).slice(0, 8);
-      const lines = pres.map(
-        (p) => `• ${p.systemName} — influence ${pct(p.influence)} ${statesStr(p.activeStates)}`
-      );
+      const lines = pres.map(p => `• ${p.systemName} — influence ${pct(p.influence)} ${statesStr(p.activeStates)}`);
       return {
         text: [
           `**Faction Status (EBGS):** ${doc.name}`,
@@ -224,7 +215,7 @@ async function run(input) {
       const d = r.data || {};
       const ranks =
         (d.commanderRanksPilot || [])
-          .map((r) => `${r.rankName}: ${r.rankValue}${typeof r.rankProgress === "number" ? ` (${Math.round(r.rankProgress * 100)}%)` : ""}`)
+          .map(r => `${r.rankName}: ${r.rankValue}${typeof r.rankProgress === "number" ? ` (${Math.round(r.rankProgress * 100)}%)` : ""}`)
           .join(", ") || "n/a";
       return {
         text: [
@@ -244,7 +235,7 @@ async function run(input) {
       if (r.error) return { text: `EliteBGS error: ${r.error}` };
       const docs = Array.isArray(r.data?.docs) ? r.data.docs : [];
       if (!docs.length) return { text: `No stations found in ${system} (EBGS).` };
-      const top = docs.slice(0, 10).map((s) => `• ${s.name} — ${s.type || "Station"} — ${s.controllingFaction || "n/a"}`);
+      const top = docs.slice(0, 10).map(s => `• ${s.name} — ${s.type || "Station"} — ${s.controllingFaction || "n/a"}`);
       return { text: `**Stations in ${system} (EBGS):**\n${top.join("\n")}` };
     }
 
@@ -254,7 +245,7 @@ async function run(input) {
       if (r.error) return { text: `EDSM error: ${r.error}` };
       const bodies = Array.isArray(r.data?.bodies) ? r.data.bodies.slice(0, 12) : [];
       if (!bodies.length) return { text: `No bodies found for ${system} (EDSM).` };
-      const lines = bodies.map((b) => `• ${b.name} — ${b.type || "Body"}${b.isLandable ? " — landable" : ""}`);
+      const lines = bodies.map(b => `• ${b.name} — ${b.type || "Body"}${b.isLandable ? " — landable" : ""}`);
       return { text: `**Bodies in ${system} (EDSM):**\n${lines.join("\n")}` };
     }
 
@@ -263,21 +254,10 @@ async function run(input) {
       return { text: hit ? `**BGS Guide (excerpt for "${arg}")**\n${cut(hit)}` : `No guide hits for "${arg}".` };
     }
 
-    if (kind === "help") {
-      return {
-        text:
-          "Try: `system snapshot <name>`, `faction <name>`, `cmdr <name>`, `stations in <system>`, `bodies in <system>`, or `guide <keyword>`."
-      };
-    }
-
-    // fallback should never hit, but…
-    return { text: "I couldn't route that. Try `system snapshot for <system>` or `guide expansion`." };
+    return {
+      text: "Try: `system snapshot <name>`, `faction <name>`, `cmdr <name>`, `stations in <system>`, `bodies in <system>`, or `guide <keyword>`."
+    };
   } catch (e) {
     return { text: `Unhandled error: ${e.message || e}` };
   }
 }
-
-// Export in both styles to be safe with different runtimes
-module.exports = run;
-module.exports.run = run;
-export default run;
