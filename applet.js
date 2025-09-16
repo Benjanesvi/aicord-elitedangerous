@@ -9,14 +9,14 @@ const EDSM_SYS_API = "https://www.edsm.net/api-v1";
 const EDSM_SYSTEM_API = "https://www.edsm.net/api-system-v1";
 
 // TODO: set these to your repo raw URLs (branch can be main or master)
-const RAW = "https://raw.githubusercontent.com/Benjanesvi/aicord-elitedangerous";
+const RAW = "https://raw.githubusercontent.com/<USER>/<REPO>/<BRANCH>/data";
 const BGS_CHUNKS_URL = `${RAW}/bgs_chunks.json`;
 const BGS_INDEX_URL  = `${RAW}/bgs_index.json`;
 
 // INARA key is injected by AICord secrets: add a secret named INARA_API_KEY
 const APP_NAME = "SpaceForce-IntelApplet";
-const APP_VERSION = "1.0.0";
-const UA = { "User-Agent": "SpaceForce-IntelApplet/1.0 (+EDSM+INARA)" };
+const APP_VERSION = "4.0.0";
+const UA = { "User-Agent": "SpaceForce-IntelApplet/4.0 (+EDSM+INARA)" };
 const HTTP_TIMEOUT_MS = 10000;
 
 const LORE_ERRORS = true;    // convert technical failures into in-universe lines
